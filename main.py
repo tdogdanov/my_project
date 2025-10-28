@@ -1,214 +1,236 @@
+# main.py
 import argparse
 import cv2
+import os
 import time
-import traceback
-import torch
 from datetime import datetime
-from my_cv import (
-    read_image,
-    show_image,
-    convert_to_gray,
-    play_video,
-    play_camera,
-    save_image,
-    save_video,
-    log_message,
-)
+from queue import Queue
+import threading
+import torch
 from ultralytics import YOLO
+import psutil
+from utils.detect_face import detect_objects_for_face
+from utils.ipcams import open_camera, list_available_sources
 
-# -------- YOLO --------
+# ----------------------------
+DEFAULT_CUSTOM_MODEL = "models/yolov8_custom.pt"
+DEFAULT_PRETRAINED_MODEL = "models/yolov9s.pt"
+OUTPUT_ROOT = "outputs"
+CONFIDENCE_THRESHOLD = 0.8
+DETECTION_SIZE = (640, 384)
+MIN_DETECTION_SIZE = (320, 192)
+MAX_DETECTION_SIZE = (640, 384)
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
 _model = None
-def get_model():
+stop_event = threading.Event()
+
+# ----------------------------
+def log_message(msg, level="ИНФО"):
+    print(f"[{level}] {msg}")
+
+def log_system_load():
+    cpu = psutil.cpu_percent()
+    mem = psutil.virtual_memory().percent
+    log_message(f"Загрузка CPU: {cpu:.1f}% | RAM: {mem:.1f}%")
+
+# ----------------------------
+def get_model(model_path=None):
     global _model
     if _model is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        log_message(f"Загружаем YOLOv8n на {device}...")
-        _model = YOLO("yolov8n.pt").to(device)
+        model_path = model_path or (
+            DEFAULT_CUSTOM_MODEL if os.path.isfile(DEFAULT_CUSTOM_MODEL) else DEFAULT_PRETRAINED_MODEL
+        )
+        log_message(f"Загружаем модель: {model_path} на {device}")
+        _model = YOLO(model_path)
+        _model.to(device)
     return _model
 
+# ----------------------------
+def detect_objects(frame, model, conf_threshold=CONFIDENCE_THRESHOLD):
+    """Обычное детектирование (если не требуется только лицо)."""
+    input_frame = cv2.resize(frame, DETECTION_SIZE)
+    results = model(input_frame, conf=conf_threshold)
+    annotated_frame = frame.copy()
 
-def detect_objects(frame):
+    for box in results[0].boxes:
+        conf = float(box.conf[0])
+        if conf < conf_threshold:
+            continue
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        scale_x = frame.shape[1] / DETECTION_SIZE[0]
+        scale_y = frame.shape[0] / DETECTION_SIZE[1]
+        x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
+        y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+
+        cls_id = int(box.cls[0])
+        cls_name = model.names[cls_id]
+
+        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            annotated_frame,
+            f"{cls_name} {conf:.2f}",
+            (x1, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
+    return annotated_frame, results
+
+# ----------------------------
+def auto_filename(extension="mp4"):
+    timestamp = datetime.now().strftime("%H-%M-%S")
+    today = datetime.now().strftime("%Y-%m-%d")
+    dir_path = os.path.join(OUTPUT_ROOT, today)
+    os.makedirs(dir_path, exist_ok=True)
+    return os.path.join(dir_path, f"det_{timestamp}.{extension}")
+
+# ----------------------------
+def video_worker(capture, frame_queue):
+    """Захват кадров из видеопотока."""
+    while not stop_event.is_set():
+        ret, frame = capture.read()
+        if not ret:
+            break
+        if not frame_queue.full():
+            frame_queue.put(frame)
+    capture.release()
+
+# ----------------------------
+def infer_worker(frame_queue, result_queue, model, conf_threshold, face_mode=False):
+    """Фоновый поток для инференса."""
+    while not stop_event.is_set():
+        if not frame_queue.empty():
+            frame = frame_queue.get()
+            with torch.no_grad():
+                if face_mode:
+                    annotated, results = detect_objects_for_face(frame, model, conf_threshold)
+                else:
+                    annotated, results = detect_objects(frame, model, conf_threshold)
+            result_queue.put((annotated, results))
+
+# ----------------------------
+def adjust_imgsz(fps, objs_count, imgsz, min_size=MIN_DETECTION_SIZE, max_size=MAX_DETECTION_SIZE):
+    w, h = imgsz
+    if fps < 15:
+        if objs_count < 5:
+            w = min(int(w * 1.1), max_size[0])
+            h = min(int(h * 1.1), max_size[1])
+        else:
+            w = max(int(w * 0.8), min_size[0])
+            h = max(int(h * 0.8), min_size[1])
+    elif fps > 25:
+        w = max(int(w * 0.9), min_size[0])
+        h = max(int(h * 0.9), min_size[1])
+    return (w, h)
+
+# ----------------------------
+def get_video_writer(save_path, width, height, fps):
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"X264")
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise Exception("X264 не доступен")
+    except:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+    return writer
+
+# ----------------------------
+def process_camera_sources(cameras, gray=False, save_video=None, conf_threshold=CONFIDENCE_THRESHOLD, face_mode=False):
+    global DETECTION_SIZE
     model = get_model()
-    results = model(frame)
-    return results[0].plot()
 
+    for cam_id in cameras:
+        try:
+            cap = open_camera(cam_id)
+        except IOError as e:
+            log_message(str(e), "ОШИБКА")
+            continue
 
-def auto_filename(extension: str) -> str:
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    return f"output_{timestamp}.{extension}"
+        frame_queue = Queue(maxsize=2)
+        result_queue = Queue(maxsize=2)
 
+        threading.Thread(target=video_worker, args=(cap, frame_queue), daemon=True).start()
+        threading.Thread(
+            target=infer_worker,
+            args=(frame_queue, result_queue, model, conf_threshold, face_mode),
+            daemon=True
+        ).start()
 
-# -------- Видео и камера с детекцией --------
-def play_video_with_detection(video_path, show_gray=False, save_path=None):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        log_message(f"Не удалось открыть видео {video_path}", "ERROR")
-        return
+        writer = None
+        if save_video:
+            save_path = auto_filename("mp4") if save_video == "auto" else save_video
+            h, w = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fps_cap = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            writer = get_video_writer(save_path, w, h, fps_cap)
+            log_message(f"Сохраняем видео: {save_path}, размер: {w}x{h}")
 
-    prev_time = time.time()
-    frame_count = 0
-    saved_frames = []
-    timestamps = []
+        frame_times = []
+        last_fps_log = time.time()
 
-    try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            if not result_queue.empty():
+                annotated, results = result_queue.get()
+                if gray:
+                    annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2GRAY)
+                    annotated = cv2.cvtColor(annotated, cv2.COLOR_GRAY2BGR)
+
+                cv2.imshow(f"Камера {cam_id}", annotated)
+                if writer:
+                    writer.write(annotated)
+
+                frame_times.append(time.time())
+                if len(frame_times) > 10:
+                    fps = len(frame_times) / (frame_times[-1] - frame_times[0])
+                    objs_count = len(results[0].boxes)
+                    if time.time() - last_fps_log > 2:
+                        log_message(f"Камера {cam_id} | FPS: {fps:.1f} | Объекты: {objs_count}")
+                        log_system_load()
+                        last_fps_log = time.time()
+                    DETECTION_SIZE = adjust_imgsz(fps, objs_count, DETECTION_SIZE)
+
+            if cv2.waitKey(1) & 0xFF == ord("q") or stop_event.is_set():
+                log_message(f"Остановка камеры {cam_id}")
                 break
 
-            frame = detect_objects(frame)
-            if show_gray:
-                frame = convert_to_gray(frame)
+        if writer:
+            writer.release()
+    cv2.destroyAllWindows()
 
-            cv2.imshow("Video Object Detection", frame)
-
-            if save_path:
-                saved_frames.append(frame.copy())
-                timestamps.append(time.time())
-
-            frame_count += 1
-            if frame_count >= 10:
-                now = time.time()
-                fps = frame_count / (now - prev_time)
-                log_message(f"FPS: {fps:.2f}")
-                prev_time, frame_count = now, 0
-
-            if cv2.waitKey(25) & 0xFF == ord("q"):
-                log_message("Видео остановлено пользователем")
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        if save_path and saved_frames:
-            if len(timestamps) > 1:
-                intervals = [t2 - t1 for t1, t2 in zip(timestamps[:-1], timestamps[1:])]
-                real_fps = 1 / (sum(intervals) / len(intervals))
-            else:
-                real_fps = 25
-            save_video(saved_frames, save_path, fps=real_fps)
-
-
-def play_camera_with_detection(camera_index=0, show_gray=False, save_path=None):
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        log_message(f"Не удалось открыть камеру {camera_index}", "ERROR")
-        return
-
-    log_message(f"Камера {camera_index} запущена. Q - выход, Ctrl+C - прерывание.")
-    frame_count = 0
-    saved_frames = []
-    timestamps = []
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                log_message("Не удалось получить кадр с камеры", "ERROR")
-                break
-
-            frame = detect_objects(frame)
-            if show_gray:
-                frame = convert_to_gray(frame)
-
-            cv2.imshow("Camera Object Detection", frame)
-
-            if save_path:
-                saved_frames.append(frame.copy())
-                timestamps.append(time.time())
-
-            frame_count += 1
-            if frame_count >= 10:
-                if len(timestamps) > 1:
-                    intervals = [t2 - t1 for t1, t2 in zip(timestamps[:-1], timestamps[1:])]
-                    fps = 1 / (sum(intervals) / len(intervals))
-                    log_message(f"FPS: {fps:.2f}")
-                frame_count = 0
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                log_message("Камера остановлена пользователем")
-                break
-    except KeyboardInterrupt:
-        log_message("Камера остановлена через Ctrl+C")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        if save_path and saved_frames:
-            if len(timestamps) > 1:
-                intervals = [t2 - t1 for t1, t2 in zip(timestamps[:-1], timestamps[1:])]
-                real_fps = 1 / (sum(intervals) / len(intervals))
-            else:
-                real_fps = 25
-            save_video(saved_frames, save_path, fps=real_fps)
-
-
-
-def main():
-    parser = argparse.ArgumentParser(description="OpenCV + YOLOv8 Object Detection")
-    parser.add_argument("--image", type=str, help="Путь к изображению")
-    parser.add_argument("--video", type=str, help="Путь к видео")
-    parser.add_argument("--camera", type=int, nargs="?", const=0, help="Индекс камеры")
-    parser.add_argument("--detect", action="store_true", help="Включить детекцию объектов")
-    parser.add_argument("--gray", action="store_true", help="Показать в градациях серого")
-    parser.add_argument("--save", type=str, nargs="?", const="auto", help="Сохранить результат (out.jpg/out.mp4)")
+# ----------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="YOLOv9 / YOLOv8 — Асинхронная система детекции")
+    parser.add_argument("--cams", nargs="+", default=["0"], help="Список источников (USB или URL)")
+    parser.add_argument("--gray", action="store_true", help="Черно-белый режим")
+    parser.add_argument("--save", nargs="?", const="auto", help="Сохранить видео (auto / путь)")
+    parser.add_argument("--face", action="store_true", help="Режим распознавания лица")
+    parser.add_argument("--conf", type=float, default=CONFIDENCE_THRESHOLD, help="Порог уверенности")
     args = parser.parse_args()
 
-    # -------- Изображение --------
-    if args.image:
+    # --- Преобразуем источники ---
+    sources = []
+    for c in args.cams:
         try:
-            img = read_image(args.image)
-            if args.detect:
-                img = detect_objects(img)
-            if args.gray:
-                img = convert_to_gray(img)
+            sources.append(int(c))
+        except ValueError:
+            sources.append(c)
 
-            save_path = None
-            if args.save:
-                save_path = args.save if args.save != "auto" else auto_filename("jpg")
-                save_image(img, save_path)
+    # --- Фильтруем только доступные камеры ---
+    available_sources = list_available_sources(sources)
+    if not available_sources:
+        print("[ОШИБКА] Нет доступных источников, выход.")
+        exit(1)
 
-            # Показываем всегда
-            show_image(img, "Processed Image")
+    print(f"[INFO] Доступные источники: {available_sources}")
 
-        except Exception as e:
-            log_message(f"Ошибка при обработке изображения: {e}", "ERROR")
-            traceback.print_exc()
-
-    # -------- Видео --------
-    if args.video:
-        try:
-            save_path = None
-            if args.save:
-                save_path = args.save if args.save != "auto" else auto_filename("mp4")
-
-            if args.detect:
-                play_video_with_detection(args.video, args.gray, save_path)
-            else:
-                if args.gray:
-                    log_message("--gray работает только с --detect для видео", "WARN")
-                play_video(args.video)
-
-        except Exception as e:
-            log_message(f"Ошибка при обработке видео: {e}", "ERROR")
-            traceback.print_exc()
-
-    # -------- Камера --------
-    if args.camera is not None:
-        try:
-            save_path = None
-            if args.save:
-                save_path = args.save if args.save != "auto" else auto_filename("mp4")
-
-            if args.detect:
-                play_camera_with_detection(args.camera, args.gray, save_path)
-            else:
-                if args.gray:
-                    log_message("--gray работает только с --detect для камеры", "WARN")
-                play_camera(args.camera)
-
-        except Exception as e:
-            log_message(f"Ошибка при работе с камерой: {e}", "ERROR")
-            traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()
+    process_camera_sources(
+        available_sources,
+        gray=args.gray,
+        save_video=args.save,
+        conf_threshold=args.conf,
+        face_mode=args.face
+    )

@@ -1,6 +1,8 @@
-# -----------------------------
+# ----------------------------
 # Python
 # -----------------------------
+__pycache2__/
+*.pyc
 __pycache__/
 *.pyc
 *.pyo
@@ -22,6 +24,7 @@ ENV/
 *.log
 log.txt
 error.log
+requirements.txt
 
 # -----------------------------
 # IDE и редакторы
@@ -45,3 +48,4 @@ videos/
 images/
 output/
 yolov8n.pt
+yolov9s.pt
