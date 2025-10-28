@@ -25,6 +25,7 @@ ENV/
 log.txt
 error.log
 requirements.txt
+classes.txt
 
 # -----------------------------
 # IDE и редакторы
@@ -45,6 +46,7 @@ requirements.txt
 # Большие медиа и данные
 # -----------------------------
 videos/
+data/
 images/
 output/
 yolov8n.pt
